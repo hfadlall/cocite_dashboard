@@ -602,12 +602,43 @@ document.getElementById("reset").addEventListener("click", () => {
 });
 
 // ---- corpus upload + revert --------------------------------------------
+// gzip the CSV in the browser before POSTing. Bibliographic CSVs of this
+// shape compress 6-10x, which lets files of ~14 MB fit under Vercel's
+// 4.5 MB request-body cap. The server detects gzip by magic bytes and
+// decompresses before parsing.
+async function gzipBlob(file) {
+  if (typeof CompressionStream === "undefined") return file;  // ancient browser
+  const stream = file.stream().pipeThrough(new CompressionStream("gzip"));
+  return await new Response(stream).blob();
+}
+
 async function uploadCSV(file) {
   if (!file) return;
   overlay.classList.remove("hidden");
-  overlay.textContent = "uploading and parsing CSV\u2026";
+  overlay.textContent = "compressing CSV\u2026";
+
+  let payload;
+  try {
+    payload = await gzipBlob(file);
+  } catch (e) {
+    overlay.textContent = "compression failed: " + e.message;
+    return;
+  }
+  // Client-side guard: catch oversize before we waste a round trip.
+  const HARD_LIMIT = 4_500_000;
+  if (payload.size > HARD_LIMIT) {
+    overlay.textContent =
+      `gzipped CSV is ${(payload.size/1e6).toFixed(1)} MB, over the ` +
+      `${(HARD_LIMIT/1e6).toFixed(1)} MB upload limit. ` +
+      `Try a smaller corpus, or remove rows before re-exporting.`;
+    return;
+  }
+
+  overlay.textContent =
+    `uploading ${(payload.size/1e6).toFixed(2)} MB ` +
+    `(from ${(file.size/1e6).toFixed(1)} MB raw)\u2026`;
   const fd = new FormData();
-  fd.append("file", file);
+  fd.append("file", payload, (file.name || "upload.csv") + ".gz");
   try {
     const r = await fetch("/api/load", { method: "POST", body: fd });
     if (!r.ok) {

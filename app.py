@@ -16,6 +16,7 @@ Run:  python app.py
 Then open  http://127.0.0.1:5000
 """
 import csv
+import gzip
 import io
 import json
 import os
@@ -29,10 +30,15 @@ BASE = os.path.dirname(os.path.abspath(__file__))
 CORPUS_PATH = os.path.join(BASE, "data", "corpus.json")
 PAIRS_PATH = os.path.join(BASE, "data", "pairs.json")
 
-# Hard ceiling on uploaded CSV size. Vercel Hobby caps request bodies at
-# ~4.5 MB; we reject larger payloads explicitly so the user gets a clear
-# message instead of a generic 413 from the platform.
+# Hard ceiling on the COMPRESSED upload size. Vercel Hobby caps request
+# bodies at ~4.5 MB; the frontend gzips the CSV before sending so this
+# is what arrives over the wire. Raw CSVs typically compress 6-10x for
+# bibliographic data, so this comfortably accommodates the ~14 MB
+# master_citation_dataset.csv.
 MAX_UPLOAD_BYTES = 4_500_000
+# Separate guardrail on the DECOMPRESSED size to bound memory + parse
+# time and to neutralise any malformed/gzip-bomb payloads.
+MAX_DECOMPRESSED_BYTES = 50_000_000
 
 app = Flask(__name__, static_folder="static")
 app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_BYTES + 100_000  # small headroom
@@ -377,9 +383,25 @@ def load():
         return jsonify({"error": "no CSV file provided"}), 400
     if len(raw) > MAX_UPLOAD_BYTES:
         return jsonify({
-            "error": f"file is {len(raw)/1e6:.1f} MB; the upload limit "
-                     f"is {MAX_UPLOAD_BYTES/1e6:.1f} MB"
+            "error": f"compressed payload is {len(raw)/1e6:.1f} MB; "
+                     f"the upload limit is {MAX_UPLOAD_BYTES/1e6:.1f} MB"
         }), 413
+
+    # gzip-detect by magic bytes (1f 8b). The frontend always gzips
+    # before sending so a real CSV that survives Vercel's body limit
+    # almost certainly arrives compressed -- but accept raw text too
+    # for curl users and as a fallback if CompressionStream is missing.
+    if raw[:2] == b"\x1f\x8b":
+        try:
+            raw = gzip.decompress(raw)
+        except OSError as e:
+            return jsonify({"error": f"could not decompress upload: {e}"}), 400
+        if len(raw) > MAX_DECOMPRESSED_BYTES:
+            return jsonify({
+                "error": f"file expands to {len(raw)/1e6:.1f} MB; the "
+                         f"decompressed limit is "
+                         f"{MAX_DECOMPRESSED_BYTES/1e6:.0f} MB"
+            }), 413
 
     try:
         text = raw.decode("utf-8-sig")  # tolerate Excel-saved BOMs
