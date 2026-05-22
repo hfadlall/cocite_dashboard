@@ -1,0 +1,19 @@
+# Local Claude Code state
+.claude/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Source CSV is handed off separately, not stored in the repo
+master_citation_dataset.csv
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
