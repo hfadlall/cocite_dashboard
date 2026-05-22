@@ -15,43 +15,87 @@ raw reference-pair combinations.
 Run:  python app.py
 Then open  http://127.0.0.1:5000
 """
+import csv
+import io
 import json
 import os
 from collections import defaultdict
 
 from flask import Flask, jsonify, request, send_from_directory
 
+from preprocess import build_from_csv
+
 BASE = os.path.dirname(os.path.abspath(__file__))
 CORPUS_PATH = os.path.join(BASE, "data", "corpus.json")
 PAIRS_PATH = os.path.join(BASE, "data", "pairs.json")
 
+# Hard ceiling on uploaded CSV size. Vercel Hobby caps request bodies at
+# ~4.5 MB; we reject larger payloads explicitly so the user gets a clear
+# message instead of a generic 413 from the platform.
+MAX_UPLOAD_BYTES = 4_500_000
+
 app = Flask(__name__, static_folder="static")
+app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_BYTES + 100_000  # small headroom
 
 # ---------------------------------------------------------------------------
-# Load data once at startup
+# Active dataset (module-level globals). Loaded once from the bundled JSON
+# at import time and then mutated in-place when the user uploads a custom
+# CSV via /api/load. Subsequent /api/meta and /api/graph calls read from
+# these globals, so the swap is transparent to the rest of the app.
+#
+# Because Vercel functions are stateless, an uploaded dataset only lives
+# as long as the warm container does -- once it goes cold and a fresh
+# instance starts, the bundled corpus is reloaded and the user has to
+# re-upload. For the single-user research workflow this dashboard is
+# built for, that's an acceptable tradeoff vs. introducing a blob store.
 # ---------------------------------------------------------------------------
+CORPUS = None
+PAIRS = None
+REFS = None
+ARTICLES = None
+JOURNALS = None
+REF_BY_I = None
+PX = None
+PY = None
+PARTS = None
+N_PAIRS = 0
+ACTIVE_SOURCE = "bundled"   # "bundled" or "uploaded" -- exposed via /api/meta
+
+
+def _set_active(corpus, pairs, source):
+    """Install corpus + pairs as the active dataset for graph queries.
+
+    Updates every module-level handle in one shot so the in-flight
+    request finishes against a consistent dataset. Derived structures
+    (REF_BY_I lookup, the unzipped pair arrays) are rebuilt here too.
+    """
+    global CORPUS, PAIRS, REFS, ARTICLES, JOURNALS, REF_BY_I
+    global PX, PY, PARTS, N_PAIRS, ACTIVE_SOURCE
+    CORPUS = corpus
+    PAIRS = pairs
+    REFS = corpus["refs"]
+    ARTICLES = corpus["articles"]
+    JOURNALS = corpus["journals"]
+    REF_BY_I = {r["i"]: r for r in REFS}
+    PX = pairs["x"]
+    PY = pairs["y"]
+    PARTS = pairs["arts"]
+    N_PAIRS = len(PX)
+    ACTIVE_SOURCE = source
+
+
+# Load the bundled default at import time.
 for p in (CORPUS_PATH, PAIRS_PATH):
     if not os.path.exists(p):
         raise SystemExit(
             f"Missing {p}\n"
             f"Run:  python preprocess.py /path/to/master_citation_dataset.csv"
         )
-
-with open(CORPUS_PATH) as f:
-    CORPUS = json.load(f)
-with open(PAIRS_PATH) as f:
-    PAIRS = json.load(f)
-
-REFS = CORPUS["refs"]
-ARTICLES = CORPUS["articles"]
-JOURNALS = CORPUS["journals"]
-REF_BY_I = {r["i"]: r for r in REFS}
-
-# pairs index as parallel arrays
-PX = PAIRS["x"]            # source ref id
-PY = PAIRS["y"]            # target ref id
-PARTS = PAIRS["arts"]      # list of contributing article indices per pair
-N_PAIRS = len(PX)
+with open(CORPUS_PATH) as _f:
+    _bundled_corpus = json.load(_f)
+with open(PAIRS_PATH) as _f:
+    _bundled_pairs = json.load(_f)
+_set_active(_bundled_corpus, _bundled_pairs, "bundled")
 
 print(f"Loaded {len(REFS):,} refs, {len(ARTICLES):,} articles, "
       f"{len(JOURNALS)} journals, {N_PAIRS:,} co-citation pairs")
@@ -306,6 +350,76 @@ def meta():
         "n_articles": len(ARTICLES),
         "n_refs": len(REFS),
         "n_pairs": N_PAIRS,
+        "source": ACTIVE_SOURCE,
+    })
+
+
+@app.route("/api/load", methods=["POST"])
+def load():
+    """Replace the active dataset with the user's uploaded CSV.
+
+    Accepts the file either as a multipart upload (field name `file`)
+    or as the raw request body. The CSV must use the same column names
+    as master_citation_dataset.csv (citing_UT, cited_canonical_id,
+    plus optional citing_year/journal/title and cited_label/year).
+
+    Returns the new /api/meta payload on success so the frontend can
+    refresh its controls without a second round-trip.
+    """
+    raw = b""
+    upload = request.files.get("file")
+    if upload is not None:
+        raw = upload.read()
+    if not raw:
+        # Allow raw POST bodies too (curl convenience)
+        raw = request.get_data(cache=False)
+    if not raw:
+        return jsonify({"error": "no CSV file provided"}), 400
+    if len(raw) > MAX_UPLOAD_BYTES:
+        return jsonify({
+            "error": f"file is {len(raw)/1e6:.1f} MB; the upload limit "
+                     f"is {MAX_UPLOAD_BYTES/1e6:.1f} MB"
+        }), 413
+
+    try:
+        text = raw.decode("utf-8-sig")  # tolerate Excel-saved BOMs
+    except UnicodeDecodeError:
+        try:
+            text = raw.decode("latin-1")
+        except Exception as e:
+            return jsonify({"error": f"could not decode file: {e}"}), 400
+
+    try:
+        corpus, pairs = build_from_csv(csv.DictReader(io.StringIO(text)))
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        return jsonify({"error": f"failed to parse CSV: {e}"}), 400
+
+    _set_active(corpus, pairs, "uploaded")
+    return jsonify({
+        "year_min": CORPUS["year_min"],
+        "year_max": CORPUS["year_max"],
+        "journals": JOURNALS,
+        "n_articles": len(ARTICLES),
+        "n_refs": len(REFS),
+        "n_pairs": N_PAIRS,
+        "source": ACTIVE_SOURCE,
+    })
+
+
+@app.route("/api/reset", methods=["POST"])
+def reset_corpus():
+    """Revert the active dataset to the bundled corpus."""
+    _set_active(_bundled_corpus, _bundled_pairs, "bundled")
+    return jsonify({
+        "year_min": CORPUS["year_min"],
+        "year_max": CORPUS["year_max"],
+        "journals": JOURNALS,
+        "n_articles": len(ARTICLES),
+        "n_refs": len(REFS),
+        "n_pairs": N_PAIRS,
+        "source": ACTIVE_SOURCE,
     })
 
 

@@ -118,6 +118,37 @@
     font:inherit; font-size:12px; font-family:ui-monospace,Menlo,monospace;
   }
   .toggle-pairs:hover{border-color:var(--muted);}
+  /* Floating zoom controls on the canvas: +, -, fit-to-content */
+  .zoomctl{
+    position:absolute; left:14px; top:14px; z-index:8;
+    display:flex; flex-direction:column; gap:4px;
+  }
+  .zoomctl button{
+    width:30px; height:30px; background:var(--panel);
+    border:1px solid var(--line); border-radius:3px; cursor:pointer;
+    font:inherit; font-size:14px; line-height:1;
+    font-family:ui-monospace,Menlo,monospace; color:var(--ink);
+    padding:0; display:flex; align-items:center; justify-content:center;
+  }
+  .zoomctl button:hover{border-color:var(--muted); background:var(--bg);}
+  .zoomctl button .fitglyph{font-size:11px; letter-spacing:.04em;}
+  /* Upload row at top of sidebar */
+  .corpus-row{
+    display:flex; gap:6px; align-items:center;
+  }
+  .corpus-row button{
+    flex:1; padding:7px 6px; background:var(--bg); color:var(--ink);
+    border:1px solid var(--line); border-radius:3px; font:inherit;
+    font-size:12px; cursor:pointer;
+    font-family:ui-monospace,Menlo,monospace;
+  }
+  .corpus-row button:hover{border-color:var(--muted);}
+  .corpus-row button.danger-tint{color:var(--accent);}
+  .corpus-tag{
+    font-size:10px; font-family:ui-monospace,Menlo,monospace;
+    color:var(--muted); margin-top:4px; letter-spacing:.04em;
+  }
+  .corpus-tag.uploaded{color:var(--accent);}
   .overlay{
     position:absolute; inset:0; display:flex; align-items:center;
     justify-content:center; color:var(--muted); font-size:14px;
@@ -133,6 +164,17 @@
 </header>
 <div class="wrap">
   <aside>
+    <div class="field">
+      <label>Corpus</label>
+      <div class="corpus-row">
+        <button type="button" id="uploadBtn">Upload CSV&hellip;</button>
+        <button type="button" id="resetCorpusBtn" class="danger-tint"
+                title="Revert to the bundled corpus" style="flex:0 0 auto;
+                padding-left:9px;padding-right:9px;">revert</button>
+      </div>
+      <input type="file" id="csvFile" accept=".csv,text/csv" hidden>
+      <div class="corpus-tag" id="corpusTag">bundled</div>
+    </div>
     <div class="field">
       <label>Citing-article year</label>
       <div class="yr">
@@ -183,11 +225,19 @@
     </div>
     <button class="apply" id="apply">Rebuild network</button>
     <button class="ghost" id="reset">Reset filters</button>
+    <button class="ghost" id="exportBtn">Export visible graph (CSV)</button>
     <div class="stats" id="stats">&mdash;</div>
   </aside>
   <main>
     <canvas id="cv"></canvas>
     <div class="overlay" id="overlay">loading&hellip;</div>
+    <div class="zoomctl">
+      <button type="button" id="zoomIn" title="Zoom in">+</button>
+      <button type="button" id="zoomOut" title="Zoom out">&minus;</button>
+      <button type="button" id="zoomFit" title="Fit graph to window">
+        <span class="fitglyph">fit</span>
+      </button>
+    </div>
     <button class="toggle-pairs" id="togPairs">Top pairs &#9656;</button>
     <div class="legend" id="legend"></div>
     <div class="tip" id="tip"></div>

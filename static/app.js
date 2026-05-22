@@ -85,31 +85,56 @@ function updateLegend() {
     `<div class="row"><span class="dot" style="background:#b9b3a4"></span>no year</div>`;
 }
 
+// ---- meta application (used by init, upload, and revert) ---------------
+// Applies a /api/meta response to the UI. Called any time the active
+// dataset changes, so it must be safe to re-run -- which means clearing
+// the journals dropdown each time before repopulating.
+function applyMeta(m) {
+  META = m;
+  document.getElementById("yFrom").value = m.year_min;
+  document.getElementById("yTo").value = m.year_max;
+  document.getElementById("corpusline").textContent =
+    `${m.n_articles} citing articles \u00b7 ${m.n_refs.toLocaleString()} references \u00b7 ` +
+    `${m.n_pairs.toLocaleString()} co-citation pairs indexed`;
+  const sel = document.getElementById("jrnl");
+  // first option is the static "All journals" placeholder; drop the rest
+  while (sel.options.length > 1) sel.remove(1);
+  m.journals.forEach(j => {
+    const o = document.createElement("option");
+    o.value = j;
+    o.textContent = j.length > 38 ? j.slice(0, 36) + "\u2026" : j;
+    sel.appendChild(o);
+  });
+  setCorpusTag(m.source || "bundled");
+  updateLegend();
+}
+
+function setCorpusTag(source) {
+  const tag = document.getElementById("corpusTag");
+  const revertBtn = document.getElementById("resetCorpusBtn");
+  if (source === "uploaded") {
+    tag.textContent = "uploaded \u2014 in-memory only";
+    tag.classList.add("uploaded");
+    revertBtn.style.display = "";
+  } else {
+    tag.textContent = "bundled";
+    tag.classList.remove("uploaded");
+    revertBtn.style.display = "none";
+  }
+}
+
 // ---- init: fetch metadata, populate controls ---------------------------
 async function init() {
   fit();
   try {
     const m = await fetch("/api/meta").then(r => r.json());
-    META = m;
-    document.getElementById("yFrom").value = m.year_min;
-    document.getElementById("yTo").value = m.year_max;
-    document.getElementById("corpusline").textContent =
-      `${m.n_articles} citing articles \u00b7 ${m.n_refs.toLocaleString()} references \u00b7 ` +
-      `${m.n_pairs.toLocaleString()} co-citation pairs indexed`;
-    const sel = document.getElementById("jrnl");
-    m.journals.forEach(j => {
-      const o = document.createElement("option");
-      o.value = j;
-      o.textContent = j.length > 38 ? j.slice(0, 36) + "\u2026" : j;
-      sel.appendChild(o);
-    });
+    applyMeta(m);
   } catch (e) {
     document.getElementById("corpusline").textContent =
       "backend not reachable \u2014 is app.py running?";
     overlay.textContent = "Cannot reach the backend.\nStart it with:  python app.py";
     return;
   }
-  updateLegend();
   rebuild();
 }
 
@@ -575,5 +600,127 @@ document.getElementById("reset").addEventListener("click", () => {
   document.getElementById("bridgeMode").checked = false;
   rebuild();
 });
+
+// ---- corpus upload + revert --------------------------------------------
+async function uploadCSV(file) {
+  if (!file) return;
+  overlay.classList.remove("hidden");
+  overlay.textContent = "uploading and parsing CSV\u2026";
+  const fd = new FormData();
+  fd.append("file", file);
+  try {
+    const r = await fetch("/api/load", { method: "POST", body: fd });
+    if (!r.ok) {
+      let msg = r.statusText;
+      try { msg = (await r.json()).error || msg; } catch (_) {}
+      overlay.textContent = "upload failed: " + msg;
+      return;
+    }
+    applyMeta(await r.json());
+  } catch (e) {
+    overlay.textContent = "upload failed: " + e.message;
+    return;
+  }
+  rebuild();
+}
+
+async function revertCorpus() {
+  overlay.classList.remove("hidden");
+  overlay.textContent = "reverting to bundled corpus\u2026";
+  try {
+    const r = await fetch("/api/reset", { method: "POST" });
+    if (!r.ok) { overlay.textContent = "revert failed: " + r.statusText; return; }
+    applyMeta(await r.json());
+  } catch (e) {
+    overlay.textContent = "revert failed: " + e.message;
+    return;
+  }
+  rebuild();
+}
+
+// ---- zoom controls -----------------------------------------------------
+// Scale `view.k` while holding a chosen screen point fixed in world space.
+// For + / - we hold the canvas centre; for fit we just call the existing
+// centerView() which recomputes both k and translation from the layout.
+function zoomAround(sx, sy, factor) {
+  const nk = Math.max(0.15, Math.min(6, view.k * factor));
+  view.x = sx - (sx - view.x) * (nk / view.k);
+  view.y = sy - (sy - view.y) * (nk / view.k);
+  view.k = nk;
+  draw();
+}
+function zoomIn()  { zoomAround(cv.clientWidth / 2, cv.clientHeight / 2, 1.25); }
+function zoomOut() { zoomAround(cv.clientWidth / 2, cv.clientHeight / 2, 0.80); }
+function zoomFit() { centerView(); draw(); }
+
+// ---- CSV export of the current view ------------------------------------
+// One row per visible reference. Columns include local + corpus-wide
+// citations, cluster id (1-indexed for readability), and the sum of the
+// node's incident edge weights, i.e. the total co-citation strength
+// running through it in the current filtered view.
+function csvCell(v) {
+  if (v == null) return "";
+  const s = String(v);
+  return /[",\n\r]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+}
+function exportCSV() {
+  if (!layout.length) {
+    overlay.classList.remove("hidden");
+    overlay.textContent = "Nothing to export \u2014 rebuild the network first.";
+    setTimeout(() => overlay.classList.add("hidden"), 1800);
+    return;
+  }
+  const totalStrength = {};
+  for (const n of layout) totalStrength[n.id] = 0;
+  for (const e of links) {
+    totalStrength[e.s] = (totalStrength[e.s] || 0) + e.w;
+    totalStrength[e.t] = (totalStrength[e.t] || 0) + e.w;
+  }
+  const cols = ["ref_id", "label", "year", "local_citations",
+                "total_citations", "cluster", "degree",
+                "co_citation_strength", "cross_cluster_links",
+                "bridge_ratio", "is_bridge"];
+  const rows = [cols.join(",")];
+  for (const n of layout) {
+    rows.push([
+      n.id, n.label, n.year == null ? "" : n.year,
+      n.local, n.total,
+      n.cluster + 1,                            // 1-indexed for spreadsheets
+      n.degree, totalStrength[n.id] || 0,
+      n.cross, n.bridge_ratio, n.bridge ? "true" : "false",
+    ].map(csvCell).join(","));
+  }
+  // BOM + CRLF so Excel opens it cleanly without import dialogs
+  const body = "\ufeff" + rows.join("\r\n") + "\r\n";
+  const blob = new Blob([body], { type: "text/csv;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const yf = document.getElementById("yFrom").value;
+  const yt = document.getElementById("yTo").value;
+  const ms = document.getElementById("minStr").value;
+  const mc = document.getElementById("minCit").value;
+  const mn = document.getElementById("maxN").value;
+  const fname = `cocitation_${yf}-${yt}_str${ms}_cit${mc}_n${mn}.csv`;
+  const a = document.createElement("a");
+  a.href = url; a.download = fname;
+  document.body.appendChild(a); a.click();
+  document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 1500);
+}
+
+// ---- wire up the new controls ------------------------------------------
+document.getElementById("uploadBtn").addEventListener("click", () => {
+  document.getElementById("csvFile").click();
+});
+document.getElementById("csvFile").addEventListener("change", e => {
+  const f = e.target.files && e.target.files[0];
+  uploadCSV(f);
+  e.target.value = "";   // allow re-uploading the same filename
+});
+document.getElementById("resetCorpusBtn").addEventListener("click", revertCorpus);
+document.getElementById("zoomIn").addEventListener("click", zoomIn);
+document.getElementById("zoomOut").addEventListener("click", zoomOut);
+document.getElementById("zoomFit").addEventListener("click", zoomFit);
+document.getElementById("exportBtn").addEventListener("click", exportCSV);
+
 
 init();
