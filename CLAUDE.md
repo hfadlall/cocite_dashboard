@@ -30,7 +30,12 @@ code over clever code.
 ```
 cocite_dashboard/
   preprocess.py    master_citation_dataset.csv -> data/corpus.json + data/pairs.json
-  app.py           Flask backend; endpoints /api/meta and /api/graph
+  cocitation.py    standalone analytical core (no Flask dep): subgraph
+                   filtering, modularity clustering, bridging metrics.
+                   Imported by app.py; also runs as a CLI that writes
+                   GraphML + node/edge CSV for sharing.
+  app.py           Flask backend; endpoints /api/meta, /api/graph,
+                   /api/load, /api/reset
   run.sh           convenience launcher
   requirements.txt Flask + networkx
   data/            corpus.json, pairs.json  (generated; do not hand-edit)
