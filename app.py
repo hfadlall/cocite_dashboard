@@ -20,7 +20,7 @@ import os
 from flask import Flask, jsonify, request, send_from_directory
 
 from preprocess import build_from_csv
-from cocitation import build_cocitation_graph
+from cocitation import EDGE_WEIGHT_MODES, build_cocitation_graph
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 CORPUS_PATH = os.path.join(BASE, "data", "corpus.json")
@@ -203,6 +203,14 @@ def graph():
         max_nodes = max(10, min(600, int(request.args.get("max_nodes", 150))))
         journal = request.args.get("journal", "").strip()
         min_citations = max(0, int(request.args.get("min_citations", 0)))
+        edge_weight_mode = request.args.get("edge_weight_mode", "raw")
+        if edge_weight_mode not in EDGE_WEIGHT_MODES:
+            edge_weight_mode = "raw"
+        # min_normalized_weight is mode-scaled (0..1 for cosine/jaccard,
+        # unbounded for association strength), so we accept a float and
+        # only floor it at 0.  Negative inputs are ignored.
+        min_normalized_weight = max(
+            0.0, float(request.args.get("min_normalized_weight", 0)))
     except ValueError:
         return jsonify({"error": "invalid parameters"}), 400
 
@@ -213,6 +221,8 @@ def graph():
         min_strength=min_strength,
         min_citations=min_citations,
         max_nodes=max_nodes,
+        edge_weight_mode=edge_weight_mode,
+        min_normalized_weight=min_normalized_weight,
     ))
 
 

@@ -82,19 +82,75 @@ mega-cited hub will have many cross links simply because it has many
 links total.  The ratio test isolates references whose CITATION
 POSITION genuinely spans clusters.
 
+The aggregated ``w_cross`` / ``w_intra`` sums use the RAW co-citation
+counts even when a normalised edge-weight mode is selected, so they
+remain interpretable as citation tallies across modes.
+
 Caveat: this surfaces references whose position bridges clusters,
 which is not the same as identifying the lightly-cited paper that
 actually created the bridge.  The bridging paper itself often falls
 below the node filter; what survives is the cross-cluster link it
 created between two prominent anchors.
+
+
+Edge-weight modes (normalisation)
+---------------------------------
+``raw`` is the default and reproduces the original dashboard
+behaviour: each edge's weight is c_ij, the number of selected citing
+articles that co-cite both endpoints.
+
+Three normalisation modes are available, each rescaling a co-citation
+strength by the citation counts of its endpoints.  Let
+
+    c_i  = local citation count of reference i (within the selection)
+    c_j  = local citation count of reference j
+    c_ij = number of selected articles co-citing i and j
+    N    = number of selected citing articles
+
+* ``cosine``                      = c_ij / sqrt(c_i * c_j)        (0..1)
+* ``jaccard``                     = c_ij / (c_i + c_j - c_ij)     (0..1)
+* ``association_strength_scaled`` = N * c_ij / (c_i * c_j)        (unbounded;
+                                                                   centred near 1)
+
+The four modes do NOT share a numeric scale.  Cosine and Jaccard are
+bounded in [0, 1]; the scaled association-strength is an unbounded
+ratio centred near 1 (values > 1 indicate co-occurrence above the
+chance level under independence).  Any UI threshold on the active
+mode's weight must adapt its range and default accordingly -- a
+0.5 cutoff is restrictive on cosine, permissive on association
+strength.
+
+The selected mode's weight is used for:
+  - community detection (modularity weighting),
+  - the dashboard's top-pairs ranking and edge-width rendering,
+  - the ``selected_weight`` field on every output edge,
+  - the optional ``min_normalized_weight`` filter.
+
+The raw count c_ij is always preserved on every edge as ``w``, so a
+collaborator can recover the original network from any export
+regardless of which mode was active.  ``min_strength`` is always
+applied to c_ij (not to the selected weight); this is intentional
+and important, because normalisation makes a 1-or-2 co-citation pair
+look artificially strong when both endpoints are themselves rare.
+The raw threshold guards against that; the normalised threshold then
+acts as a SECOND filter on top.
 """
 from __future__ import annotations
 
 import csv
 import json
+import math
 import os
 from collections import defaultdict
 from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+
+# Supported edge-weight normalisation modes. See module docstring.
+EDGE_WEIGHT_MODES = (
+    "raw",
+    "cosine",
+    "jaccard",
+    "association_strength_scaled",
+)
 
 # Networkx is the one external dependency. If it is missing we fall
 # back to connected-components for clustering -- still produces a
@@ -231,6 +287,45 @@ def detect_communities(
 # ---------------------------------------------------------------------------
 # Main analysis
 # ---------------------------------------------------------------------------
+def _compute_edge_weights(c_ij: int, c_i: int, c_j: int,
+                          n_selected: int) -> Tuple[float, float, float]:
+    """Return (cosine, jaccard, association_strength_scaled) for one pair.
+
+    All three are derived from (c_ij, c_i, c_j) plus N for the scaled
+    association strength.  See the module docstring's edge-weight-modes
+    section for the formulae.  Returns 0.0 for any variant whose
+    denominator would be zero -- in practice this only happens with
+    pathological inputs, since c_ij > 0 implies c_i, c_j > 0.
+    """
+    if c_i > 0 and c_j > 0:
+        cosine = c_ij / math.sqrt(c_i * c_j)
+        ass_scaled = (n_selected * c_ij) / (c_i * c_j) if n_selected else 0.0
+    else:
+        cosine = 0.0
+        ass_scaled = 0.0
+    union = c_i + c_j - c_ij
+    jaccard = c_ij / union if union > 0 else 0.0
+    return cosine, jaccard, ass_scaled
+
+
+def _pick_selected_weight(mode: str, c_ij: int, cosine: float,
+                          jaccard: float, ass_scaled: float):
+    """Pick the active edge weight for the chosen mode.
+
+    Returns int(c_ij) in raw mode, float otherwise.  Keeping raw mode's
+    selected_weight as an int preserves byte-equivalence with the
+    pre-normalisation output (the dashboard ignored the field then;
+    callers that read it now still get the same numeric value).
+    """
+    if mode == "cosine":
+        return cosine
+    if mode == "jaccard":
+        return jaccard
+    if mode == "association_strength_scaled":
+        return ass_scaled
+    return c_ij  # raw
+
+
 def build_cocitation_graph(
     corpus: Mapping,
     pairs: Mapping,
@@ -241,6 +336,8 @@ def build_cocitation_graph(
     min_strength: int = 2,
     min_citations: int = 0,
     max_nodes: int = 150,
+    edge_weight_mode: str = "raw",
+    min_normalized_weight: float = 0.0,
 ) -> dict:
     """Compute the co-citation network for a filtered article subset.
 
@@ -256,9 +353,9 @@ def build_cocitation_graph(
         Optional citing-journal filter.  None or empty string means no
         filter.
     min_strength
-        EDGE filter.  Edges are kept only if at least this many of the
-        passing articles co-cite both endpoints.  See the module
-        docstring on the two-filters distinction.
+        EDGE filter on the raw c_ij count.  Always applied, regardless
+        of edge_weight_mode -- this is what stops a 1-or-2 co-citation
+        pair from looking "strong" under normalisation.
     min_citations
         NODE filter.  Applied BEFORE edges are considered: any
         reference cited fewer than ``min_citations`` times in the
@@ -267,6 +364,18 @@ def build_cocitation_graph(
         Cap on the number of distinct references shown, ranked by
         local citation count (with degree as tiebreaker).  Edges
         between dropped nodes are dropped too.
+    edge_weight_mode
+        One of "raw", "cosine", "jaccard", "association_strength_scaled".
+        Selects which weight drives clustering, the ``selected_weight``
+        field, and the optional normalised filter below.  See module
+        docstring for formulae and scale notes.  Default "raw"
+        reproduces the original dashboard behaviour.
+    min_normalized_weight
+        SECOND edge filter, applied on top of ``min_strength``.  Edges
+        are dropped unless their selected_weight (under the active
+        mode) is at least this value.  Default 0 means the normalised
+        filter is inactive; combined with edge_weight_mode="raw" this
+        leaves the original behaviour untouched.
 
     Returns
     -------
@@ -274,22 +383,40 @@ def build_cocitation_graph(
 
       ``nodes``  -- list of node dicts (id, label, year, total, local,
                     degree, cluster, cross, intra, w_cross, w_intra,
-                    reach, bridge_ratio, bridge).
-      ``edges``  -- list of edge dicts (s, t, w, cross) where ``cross``
-                    is True iff the edge spans clusters.
-      ``clusters`` -- list of community sizes in cluster-id order
-                    (so ``clusters[0]`` is the size of cluster 0, which
-                    is by construction the largest).
-      ``selected_articles`` -- number of citing articles passing the
-                    year + journal filter.
-      ``strong_pairs``      -- number of pairs satisfying min_strength
-                    over the selected articles, BEFORE the max_nodes
-                    cap is applied.
+                    reach, bridge_ratio, bridge).  w_cross / w_intra
+                    sum RAW c_ij even when a normalised mode is
+                    selected, so they remain interpretable across
+                    modes.
+      ``edges``  -- list of edge dicts.  Each carries:
+                       s, t           - endpoint reference ids
+                       w              - raw c_ij (always; backward compat)
+                       cross          - True iff edge spans clusters
+                       source_local   - c_i, citations of source in selection
+                       target_local   - c_j, citations of target in selection
+                       cosine, jaccard, association_strength_scaled
+                                      - the three normalised weights,
+                                        always present for tooltip /
+                                        export use
+                       selected_weight - the weight under
+                                        edge_weight_mode (drives
+                                        clustering & ranking)
+      ``clusters``           -- community sizes in cluster-id order.
+      ``selected_articles``  -- number of citing articles passing the
+                                year + journal filter.
+      ``strong_pairs``       -- number of pairs surviving BOTH the
+                                raw and normalised edge filters,
+                                BEFORE the max_nodes cap.
+      ``edge_weight_mode``   -- echo of the mode actually used.
 
     The function is pure: same inputs always produce the same output
-    (modulo set iteration order; see notes in the module's __main__
-    section for a determinism check).
+    (modulo set iteration order; see the determinism check in the
+    module's CLI).
     """
+    if edge_weight_mode not in EDGE_WEIGHT_MODES:
+        raise ValueError(
+            f"edge_weight_mode must be one of {EDGE_WEIGHT_MODES}; "
+            f"got {edge_weight_mode!r}")
+
     refs = corpus["refs"]
     articles = corpus["articles"]
     PX = pairs["x"]
@@ -329,73 +456,102 @@ def build_cocitation_graph(
     eligible = {r for r, c in ref_local_total.items()
                 if c >= min_citations}
 
-    # 4. walk the precomputed pair index, recomputing strength against
-    #    the passing-articles mask.  An edge survives only if BOTH
-    #    endpoints are eligible nodes; this is what makes the node
-    #    filter strictly stronger than the edge filter.
-    edges: List[Tuple[int, int, int]] = []
+    # 4. walk the precomputed pair index, recompute c_ij against the
+    #    passing-articles mask, then apply BOTH edge filters:
+    #      - the raw threshold (min_strength on c_ij), and
+    #      - the normalised threshold (min_normalized_weight on the
+    #        active mode's weight).
+    #    Both endpoints must be eligible nodes.  Each surviving edge is
+    #    carried with all four weight variants so downstream stages
+    #    (and exports) need not recompute them.
+    raw_edges = []  # list of (x, y, c_ij, cosine, jaccard, ass_scaled, sel)
     strong_pairs = 0
     for k in range(n_pairs):
         x, y = PX[k], PY[k]
         if x not in eligible or y not in eligible:
             continue
-        w = 0
+        c_ij = 0
         for ai in PARTS[k]:
             if passes[ai]:
-                w += 1
-        if w >= min_strength:
-            strong_pairs += 1
-            edges.append((x, y, w))
+                c_ij += 1
+        # Apply the RAW threshold first, on c_ij.  This guards against
+        # the artefact of a pair with c_ij = 1 or 2 looking "strong"
+        # under normalisation when both endpoints are themselves rare.
+        if c_ij < min_strength:
+            continue
+        c_i = ref_local_total[x]
+        c_j = ref_local_total[y]
+        cosine, jaccard, ass_scaled = _compute_edge_weights(
+            c_ij, c_i, c_j, selected)
+        selected_w = _pick_selected_weight(
+            edge_weight_mode, c_ij, cosine, jaccard, ass_scaled)
+        # Second (optional) filter, in the units of the active mode.
+        # With default min_normalized_weight=0 this is a no-op.
+        if selected_w < min_normalized_weight:
+            continue
+        strong_pairs += 1
+        raw_edges.append((x, y, c_ij, cosine, jaccard, ass_scaled,
+                          selected_w))
 
-    if not edges:
+    if not raw_edges:
         return {"nodes": [], "edges": [], "selected_articles": selected,
-                "strong_pairs": 0, "clusters": []}
+                "strong_pairs": 0, "clusters": [],
+                "edge_weight_mode": edge_weight_mode}
 
-    # 5. cap the displayed node set by local citation count
-    #    (degree as tiebreaker -- favours hubs that survive the filter).
+    # 5. cap the displayed node set by local citation count.  Ranking
+    #    uses local citations + degree as tiebreaker, NOT edge weights,
+    #    so the cap is mode-independent.
     deg: Dict[int, int] = defaultdict(int)
-    for x, y, _w in edges:
+    for x, y, *_ in raw_edges:
         deg[x] += 1
         deg[y] += 1
     candidates = sorted(deg.keys(),
                         key=lambda r: (ref_local_total[r], deg[r]),
                         reverse=True)
     keep = set(candidates[:max_nodes])
-    edges = [(x, y, w) for x, y, w in edges if x in keep and y in keep]
+    raw_edges = [e for e in raw_edges if e[0] in keep and e[1] in keep]
 
-    if not edges:
+    if not raw_edges:
         return {"nodes": [], "edges": [], "selected_articles": selected,
-                "strong_pairs": strong_pairs, "clusters": []}
+                "strong_pairs": strong_pairs, "clusters": [],
+                "edge_weight_mode": edge_weight_mode}
 
     # 6. assemble the node set from surviving edges
     node_ids = set()
     edge_deg: Dict[int, int] = defaultdict(int)
-    for x, y, _w in edges:
+    for x, y, *_ in raw_edges:
         node_ids.add(x)
         node_ids.add(y)
         edge_deg[x] += 1
         edge_deg[y] += 1
 
-    # 7. cluster + compute bridging metrics
-    comp_of, comp_sizes = detect_communities(node_ids, edges)
+    # 7. cluster on the SELECTED weight -- this is the main place
+    #    normalisation changes the analysis.  Modularity is unitless,
+    #    so passing floats is fine.
+    cluster_input = [(x, y, sel) for x, y, _c, _co, _ja, _as, sel
+                     in raw_edges]
+    comp_of, comp_sizes = detect_communities(node_ids, cluster_input)
 
+    # Bridging aggregates use RAW c_ij so a node's w_cross / w_intra
+    # remain interpretable as "citation strength of cross/intra links"
+    # regardless of which mode is active.
     cross_links: Dict[int, int] = defaultdict(int)
     intra_links: Dict[int, int] = defaultdict(int)
     w_cross: Dict[int, int] = defaultdict(int)
     w_intra: Dict[int, int] = defaultdict(int)
     reach: Dict[int, set] = defaultdict(set)
-    for x, y, w in edges:
+    for x, y, c_ij, *_ in raw_edges:
         cx, cy = comp_of[x], comp_of[y]
         if cx == cy:
             intra_links[x] += 1
             intra_links[y] += 1
-            w_intra[x] += w
-            w_intra[y] += w
+            w_intra[x] += c_ij
+            w_intra[y] += c_ij
         else:
             cross_links[x] += 1
             cross_links[y] += 1
-            w_cross[x] += w
-            w_cross[y] += w
+            w_cross[x] += c_ij
+            w_cross[y] += c_ij
             reach[x].add(cy)
             reach[y].add(cx)
 
@@ -406,38 +562,42 @@ def build_cocitation_graph(
         r = refs[nid]
         cr, it = cross_links[nid], intra_links[nid]
         total_links = cr + it
-        # bridge_ratio: share of a node's links that leave its community.
-        # Separates genuine bridges (high ratio) from mega-cited hubs
-        # that happen to have many cross links by sheer link volume.
         ratio = (cr / total_links) if total_links else 0.0
         nodes.append({
             "id": nid,
             "label": r["label"],
             "year": r["year"],
-            "total": r["total"],            # corpus-wide citation count
-            "local": ref_local_total[nid],  # citations within selection
+            "total": r["total"],
+            "local": ref_local_total[nid],
             "degree": edge_deg[nid],
             "cluster": comp_of[nid],
-            "cross": cr,                    # # of cross-cluster links
-            "intra": it,                    # # of intra-cluster links
-            "w_cross": w_cross[nid],        # strength sum of cross links
-            "w_intra": w_intra[nid],        # strength sum of intra links
-            "reach": len(reach[nid]),       # # of foreign clusters touched
+            "cross": cr,
+            "intra": it,
+            "w_cross": w_cross[nid],
+            "w_intra": w_intra[nid],
+            "reach": len(reach[nid]),
             "bridge_ratio": round(ratio, 3),
-            # a genuine bridge: at least one cross-cluster link AND a
-            # quarter of all links cross-cluster.  The 0.25 cutoff is a
-            # heuristic, not a derived threshold.
             "bridge": cr > 0 and ratio >= 0.25,
         })
 
     return {
         "nodes": nodes,
-        "edges": [{"s": x, "t": y, "w": w,
-                   "cross": comp_of[x] != comp_of[y]}
-                  for x, y, w in edges],
+        "edges": [{
+            "s": x, "t": y,
+            "w": c_ij,                       # raw c_ij, always
+            "cross": comp_of[x] != comp_of[y],
+            "source_local": ref_local_total[x],
+            "target_local": ref_local_total[y],
+            "cosine": round(cosine, 4),
+            "jaccard": round(jaccard, 4),
+            "association_strength_scaled": round(ass_scaled, 4),
+            "selected_weight": (sel if edge_weight_mode == "raw"
+                                else round(sel, 4)),
+        } for x, y, c_ij, cosine, jaccard, ass_scaled, sel in raw_edges],
         "clusters": comp_sizes,
         "selected_articles": selected,
         "strong_pairs": strong_pairs,
+        "edge_weight_mode": edge_weight_mode,
     }
 
 
@@ -498,18 +658,45 @@ def write_nodes_csv(result: dict, path: str) -> None:
 
 
 def write_edges_csv(result: dict, path: str) -> None:
-    """One row per edge with weight + cluster-crossing flag + labels."""
+    """One row per edge with full weight breakdown + labels.
+
+    ``weight`` always carries the raw co-citation count for backward
+    compatibility; ``selected_weight`` carries the value under the mode
+    the network was built with.  The three normalised variants are
+    written regardless of mode so the colleague can recompute or
+    re-rank in their tool of choice.
+    """
     by_id = {n["id"]: n for n in result["nodes"]}
-    cols = ["source_id", "source_label", "target_id", "target_label",
-            "weight", "cross_cluster"]
+    mode = result.get("edge_weight_mode", "raw")
+    cols = [
+        "source_id", "source_label", "target_id", "target_label",
+        "weight",                       # = raw c_ij (backward compat)
+        "raw_cocitations",              # explicit alias
+        "source_local_citations",       # c_i
+        "target_local_citations",       # c_j
+        "cosine_weight", "jaccard_weight",
+        "association_strength_scaled",
+        "selected_weight", "edge_weight_mode",
+        "cross_cluster",
+    ]
     with open(path, "w", encoding="utf-8", newline="") as f:
         w = csv.writer(f)
         w.writerow(cols)
         for e in sorted(result["edges"], key=lambda x: (x["s"], x["t"])):
             sl = by_id.get(e["s"], {}).get("label", "")
             tl = by_id.get(e["t"], {}).get("label", "")
-            w.writerow([e["s"], sl, e["t"], tl, e["w"],
-                        "true" if e["cross"] else "false"])
+            w.writerow([
+                e["s"], sl, e["t"], tl,
+                e["w"], e["w"],                       # weight + raw_cocitations
+                e.get("source_local", ""),
+                e.get("target_local", ""),
+                e.get("cosine", ""),
+                e.get("jaccard", ""),
+                e.get("association_strength_scaled", ""),
+                e.get("selected_weight", e["w"]),
+                mode,
+                "true" if e["cross"] else "false",
+            ])
 
 
 def write_graphml(result: dict, path: str) -> None:
@@ -560,6 +747,15 @@ def _main_cli():
     ap.add_argument("--max-nodes", type=int, default=150,
                     help="cap on number of nodes (ranked by local "
                          "citation count, degree as tiebreaker)")
+    ap.add_argument("--edge-weight-mode",
+                    choices=EDGE_WEIGHT_MODES, default="raw",
+                    help="how edge weights are computed; drives "
+                         "community detection, ranking, and the "
+                         "selected_weight column")
+    ap.add_argument("--min-normalized-weight", type=float, default=0.0,
+                    help="SECOND edge filter, applied on top of "
+                         "min-strength, in the units of the active "
+                         "edge-weight mode")
     ap.add_argument("--check-determinism", action="store_true",
                     help="run the analysis twice and confirm the "
                          "result is identical before writing")
@@ -576,7 +772,9 @@ def _main_cli():
           f"min_strength={args.min_strength}, "
           f"min_citations={args.min_citations}, "
           f"max_nodes={args.max_nodes}, "
-          f"journal={args.journal or 'all'})")
+          f"journal={args.journal or 'all'}, "
+          f"edge_weight_mode={args.edge_weight_mode}, "
+          f"min_normalized_weight={args.min_normalized_weight})")
     result = build_cocitation_graph(
         corpus, pairs,
         year_from=args.year_from, year_to=args.year_to,
@@ -584,6 +782,8 @@ def _main_cli():
         min_strength=args.min_strength,
         min_citations=args.min_citations,
         max_nodes=args.max_nodes,
+        edge_weight_mode=args.edge_weight_mode,
+        min_normalized_weight=args.min_normalized_weight,
     )
 
     n_bridges = sum(1 for n in result["nodes"] if n["bridge"])
@@ -605,6 +805,8 @@ def _main_cli():
             min_strength=args.min_strength,
             min_citations=args.min_citations,
             max_nodes=args.max_nodes,
+            edge_weight_mode=args.edge_weight_mode,
+            min_normalized_weight=args.min_normalized_weight,
         )
         a = json.dumps(_canonical(result), sort_keys=True)
         b = json.dumps(_canonical(result2), sort_keys=True)

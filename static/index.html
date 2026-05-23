@@ -191,6 +191,25 @@
       <div class="rowval"><span>articles co-citing a pair &mdash; edge filter</span><b id="minStrV">5</b></div>
     </div>
     <div class="field">
+      <label>Edge weight mode</label>
+      <select id="edgeMode">
+        <option value="raw" selected>Raw co-citation count</option>
+        <option value="cosine">Cosine normalized</option>
+        <option value="jaccard">Jaccard normalized</option>
+        <option value="association_strength_scaled">Association strength (scaled)</option>
+      </select>
+      <div class="rowval" style="margin-top:6px;line-height:1.4;">
+        <span id="edgeModeHelp">raw count of articles co-citing a pair</span></div>
+    </div>
+    <div class="field">
+      <label>Minimum normalized edge weight</label>
+      <input type="range" id="minNorm" min="0" max="10" step="1" value="0" disabled>
+      <div class="rowval">
+        <span id="minNormHelp">active only in normalized modes</span>
+        <b id="minNormV">0</b>
+      </div>
+    </div>
+    <div class="field">
       <label>Minimum citation strength</label>
       <input type="range" id="minCit" min="0" max="60" value="0">
       <div class="rowval"><span>citations of a reference &mdash; node filter</span><b id="minCitV">0</b></div>
@@ -225,7 +244,8 @@
     </div>
     <button class="apply" id="apply">Rebuild network</button>
     <button class="ghost" id="reset">Reset filters</button>
-    <button class="ghost" id="exportBtn">Export visible graph (CSV)</button>
+    <button class="ghost" id="exportBtn">Export nodes (CSV)</button>
+    <button class="ghost" id="exportEdgesBtn">Export edges (CSV)</button>
     <div class="stats" id="stats">&mdash;</div>
   </aside>
   <main>

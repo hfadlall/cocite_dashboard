@@ -155,6 +155,8 @@ async function rebuild() {
     max_nodes: document.getElementById("maxN").value,
     journal: document.getElementById("jrnl").value,
     bridging: bridgeMode ? "1" : "0",
+    edge_weight_mode: document.getElementById("edgeMode").value,
+    min_normalized_weight: document.getElementById("minNorm").value,
   });
 
   let g;
@@ -195,8 +197,16 @@ async function rebuild() {
     nodeById[n.id] = o;
     return o;
   });
+  // Preserve every edge field from the server, including the new
+  // weight variants. The dashboard reads `selected_weight` for layout
+  // force scaling and edge widths; raw `w` (= c_ij) stays available
+  // for the tooltip and CSV export.
   links = g.edges.map(e => ({
     s: e.s, t: e.t, w: e.w, cross: e.cross,
+    selected_weight: e.selected_weight,
+    cosine: e.cosine, jaccard: e.jaccard,
+    association_strength_scaled: e.association_strength_scaled,
+    source_local: e.source_local, target_local: e.target_local,
     A: nodeById[e.s], B: nodeById[e.t],
   }));
 
@@ -213,7 +223,11 @@ async function rebuild() {
 function runSim() {
   const N = layout.length;
   if (!N) { draw(); return; }
-  const maxW = Math.max(...links.map(e => e.w), 1);
+  // Layout force scaling uses the SELECTED weight (driven by the
+  // current edge_weight_mode). In raw mode selected_weight === w so
+  // this preserves the original layout exactly; in normalised modes
+  // the spring strengths follow the active scale.
+  const maxW = Math.max(...links.map(e => e.selected_weight), 1);
 
   // Group nodes by their backend-assigned cluster. The membership list is
   // fixed for this run; only positions change, so we can re-mean each step
@@ -278,7 +292,7 @@ function runSim() {
       const a = e.A, b = e.B;
       let dx = b.x - a.x, dy = b.yy - a.yy;
       const d = Math.sqrt(dx * dx + dy * dy) + 0.01;
-      const w = e.w / maxW;
+      const w = e.selected_weight / maxW;
       const f = (d - 72) * 0.012 * (0.4 + w);
       dx /= d; dy /= d;
       a.vx += dx * f; a.vy += dy * f;
@@ -368,12 +382,15 @@ function draw() {
   if (!layout.length) { ctx.restore(); return; }
 
   const term = document.getElementById("search").value.trim().toLowerCase();
-  const maxW = Math.max(...links.map(e => e.w), 1);
+  // Edge widths track the SELECTED weight so a switch to cosine /
+  // Jaccard / association-strength visibly rescales the network.
+  // In raw mode selected_weight === w so widths are unchanged.
+  const maxW = Math.max(...links.map(e => e.selected_weight), 1);
   const maxT = Math.max(...layout.map(n => n.local), 1);
 
   // edges
   for (const e of links) {
-    const w = e.w / maxW;
+    const w = e.selected_weight / maxW;
     if (bridgeMode) {
       if (e.cross) {
         // cross-cluster links: the bridging signal — draw them red & bold
@@ -458,11 +475,29 @@ function updateStats(g) {
 function buildPairs(g) {
   document.getElementById("panelHead").textContent = "Strongest co-cited pairs";
   document.getElementById("togPairs").dataset.kind = "pairs";
-  const sorted = g.edges.slice().sort((a, b) => b.w - a.w).slice(0, 40);
+  // Rank by the SELECTED weight (matches the active edge_weight_mode).
+  // In raw mode this is c_ij and the ranking is identical to before;
+  // in normalised modes it reflects whichever similarity is active.
+  // Raw c_ij is still shown alongside so the count is never hidden.
+  const mode = (g.edge_weight_mode || "raw");
+  const sorted = g.edges.slice().sort(
+    (a, b) => b.selected_weight - a.selected_weight).slice(0, 40);
+  const fmt = v => (typeof v === "number"
+    ? (Math.abs(v) >= 100 ? v.toFixed(0)
+       : Math.abs(v) >= 1 ? v.toFixed(2) : v.toFixed(3))
+    : v);
   document.getElementById("pairsList").innerHTML = sorted.map(e => {
     const a = nodeById[e.s], b = nodeById[e.t];
     if (!a || !b) return "";
+    // Primary badge is always the raw co-citation count so the
+    // "X articles co-cited this pair" reading stays unambiguous.
+    // A secondary badge shows the selected mode's value when it's
+    // not raw (where it would just duplicate the primary number).
+    const secondary = mode === "raw" ? "" :
+      ` <span class="s" style="background:#6b6357">` +
+      `${modeShortLabel(mode)} ${fmt(e.selected_weight)}</span>`;
     return `<div class="pair"><span class="s">${e.w}\u00d7</span>` +
+      secondary +
       (e.cross ? ` <span class="s" style="background:#1e3a5f">cross</span>` : "") +
       `<br><span class="a">${shortLabel(a.label)}</span><br>` +
       `<span class="b">\u2194 ${shortLabel(b.label)}</span></div>`;
@@ -509,6 +544,37 @@ function pick(mx, my) {
   }
   return null;
 }
+
+// Closest-edge pick. Uses world-space distance with a screen-pixel
+// threshold so the hit tolerance stays consistent at any zoom level.
+function distPointToSeg(px, py, ax, ay, bx, by) {
+  const abx = bx - ax, aby = by - ay;
+  const lenSq = abx * abx + aby * aby || 1;
+  const t = Math.max(0, Math.min(1,
+    ((px - ax) * abx + (py - ay) * aby) / lenSq));
+  const qx = ax + t * abx, qy = ay + t * aby;
+  const dx = px - qx, dy = py - qy;
+  return Math.sqrt(dx * dx + dy * dy);
+}
+function pickEdge(mx, my) {
+  if (!links.length) return null;
+  const w = toWorld(mx, my);
+  const thresh = 5 / view.k;       // 5 screen pixels
+  let bestD = thresh, best = null;
+  for (const e of links) {
+    const d = distPointToSeg(w.x, w.y, e.A.x, e.A.yy, e.B.x, e.B.yy);
+    if (d < bestD) { bestD = d; best = e; }
+  }
+  return best;
+}
+
+// Short label used in the edge tooltip (mode -> human-friendly tag)
+function modeShortLabel(mode) {
+  if (mode === "cosine") return "cosine";
+  if (mode === "jaccard") return "Jaccard";
+  if (mode === "association_strength_scaled") return "assoc. scaled";
+  return "raw";
+}
 cv.addEventListener("mousedown", e => {
   const r = cv.getBoundingClientRect();
   const mx = e.clientX - r.left, my = e.clientY - r.top;
@@ -544,7 +610,41 @@ cv.addEventListener("mousemove", e => {
       }
       tip.innerHTML = `<div class="ttl">${esc(n.label)}</div>${body}`;
     } else {
-      tip.style.display = "none";
+      // No node under the cursor -- check for a nearby edge so we
+      // can surface its full weight breakdown (raw + the three
+      // normalised variants).  Per spec, raw c_ij is always shown
+      // alongside the selected weight so the active mode is never
+      // ambiguous.
+      const eHit = pickEdge(mx, my);
+      if (eHit && lastGraph) {
+        tip.style.display = "block";
+        tip.style.left = Math.min(mx + 14, cv.clientWidth - 320) + "px";
+        tip.style.top = (my + 14) + "px";
+        const mode = lastGraph.edge_weight_mode || "raw";
+        const fmt = v => (typeof v === "number"
+          ? (Math.abs(v) >= 100 ? v.toFixed(0)
+             : Math.abs(v) >= 1 ? v.toFixed(2) : v.toFixed(3))
+          : v);
+        const sl = (nodeById[eHit.s] || {}).label || "";
+        const tl = (nodeById[eHit.t] || {}).label || "";
+        const lines = [
+          `Raw co-citations (c_ij): <b>${eHit.w}</b>`,
+          `Source citations (c_i): ${eHit.source_local} \u00b7 ` +
+            `Target citations (c_j): ${eHit.target_local}`,
+          `Cosine: ${fmt(eHit.cosine)} \u00b7 ` +
+            `Jaccard: ${fmt(eHit.jaccard)}`,
+          `Assoc. strength (scaled): ` +
+            `${fmt(eHit.association_strength_scaled)}`,
+          `Selected weight (${modeShortLabel(mode)}): ` +
+            `<b>${fmt(eHit.selected_weight)}</b>` +
+            (eHit.cross ? " \u00b7 crosses clusters" : ""),
+        ];
+        tip.innerHTML =
+          `<div class="ttl">${esc(sl)}<br>\u2194 ${esc(tl)}</div>` +
+          lines.join("<br>");
+      } else {
+        tip.style.display = "none";
+      }
     }
   }
   lastM = { x: mx, y: my };
@@ -598,6 +698,9 @@ document.getElementById("reset").addEventListener("click", () => {
   document.getElementById("search").value = "";
   document.getElementById("colorMode").value = "era";
   document.getElementById("bridgeMode").checked = false;
+  document.getElementById("edgeMode").value = "raw";
+  document.getElementById("minNorm").value = 0;
+  configureNormSlider();
   rebuild();
 });
 
@@ -730,7 +833,68 @@ function exportCSV() {
   const ms = document.getElementById("minStr").value;
   const mc = document.getElementById("minCit").value;
   const mn = document.getElementById("maxN").value;
-  const fname = `cocitation_${yf}-${yt}_str${ms}_cit${mc}_n${mn}.csv`;
+  const fname = `cocitation_nodes_${yf}-${yt}_str${ms}_cit${mc}_n${mn}.csv`;
+  const a = document.createElement("a");
+  a.href = url; a.download = fname;
+  document.body.appendChild(a); a.click();
+  document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 1500);
+}
+
+// Edge-centric export with full weight breakdown per spec Change 3.
+// `weight` is always the raw co-citation count (backward compat); the
+// active mode's value lives in `selected_weight`, and the three
+// normalised variants are present regardless of mode so a colleague
+// reading the CSV can recompute anything.
+function exportEdgesCSV() {
+  if (!links.length) {
+    overlay.classList.remove("hidden");
+    overlay.textContent =
+      "Nothing to export — rebuild the network first.";
+    setTimeout(() => overlay.classList.add("hidden"), 1800);
+    return;
+  }
+  const mode = (lastGraph && lastGraph.edge_weight_mode) || "raw";
+  const cols = [
+    "source_id", "source_label",
+    "target_id", "target_label",
+    "weight",                        // = raw c_ij (backward compatibility)
+    "raw_cocitations",               // explicit alias for clarity
+    "source_local_citations",        // c_i
+    "target_local_citations",        // c_j
+    "cosine_weight",
+    "jaccard_weight",
+    "association_strength_scaled",
+    "selected_weight",
+    "edge_weight_mode",
+    "cross_cluster",
+  ];
+  const rows = [cols.join(",")];
+  const sorted = links.slice().sort(
+    (a, b) => (b.selected_weight - a.selected_weight) || (b.w - a.w));
+  for (const e of sorted) {
+    const sl = (nodeById[e.s] || {}).label || "";
+    const tl = (nodeById[e.t] || {}).label || "";
+    rows.push([
+      e.s, sl, e.t, tl,
+      e.w, e.w,                      // weight + raw_cocitations both = c_ij
+      e.source_local, e.target_local,
+      e.cosine, e.jaccard,
+      e.association_strength_scaled,
+      e.selected_weight, mode,
+      e.cross ? "true" : "false",
+    ].map(csvCell).join(","));
+  }
+  const body = "﻿" + rows.join("\r\n") + "\r\n";
+  const blob = new Blob([body], { type: "text/csv;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const yf = document.getElementById("yFrom").value;
+  const yt = document.getElementById("yTo").value;
+  const ms = document.getElementById("minStr").value;
+  const mc = document.getElementById("minCit").value;
+  const mn = document.getElementById("maxN").value;
+  const fname =
+    `cocitation_edges_${yf}-${yt}_str${ms}_cit${mc}_n${mn}_${mode}.csv`;
   const a = document.createElement("a");
   a.href = url; a.download = fname;
   document.body.appendChild(a); a.click();
@@ -752,6 +916,56 @@ document.getElementById("zoomIn").addEventListener("click", zoomIn);
 document.getElementById("zoomOut").addEventListener("click", zoomOut);
 document.getElementById("zoomFit").addEventListener("click", zoomFit);
 document.getElementById("exportBtn").addEventListener("click", exportCSV);
+document.getElementById("exportEdgesBtn").addEventListener("click", exportEdgesCSV);
+
+// Edge-weight-mode dropdown adapts the normalised-weight slider's
+// range/step to whichever mode is selected. Each scale is different
+// (cosine and Jaccard live in [0,1]; association strength is unbounded
+// and centred near 1), so a fixed slider would be misleading.
+function configureNormSlider() {
+  const mode = document.getElementById("edgeMode").value;
+  const sl = document.getElementById("minNorm");
+  const lbl = document.getElementById("minNormV");
+  const help = document.getElementById("minNormHelp");
+  const modeHelp = document.getElementById("edgeModeHelp");
+  if (mode === "raw") {
+    sl.min = 0; sl.max = 10; sl.step = 1; sl.value = 0;
+    sl.disabled = true;
+    help.textContent = "active only in normalised modes";
+    modeHelp.textContent = "raw count of articles co-citing a pair";
+  } else if (mode === "cosine") {
+    sl.min = 0; sl.max = 1; sl.step = 0.01;
+    sl.disabled = false;
+    help.textContent = "cosine similarity — bounded 0..1";
+    modeHelp.textContent =
+      "c_ij / sqrt(c_i * c_j) — favours pairs whose " +
+      "co-occurrence is high relative to their individual frequencies";
+  } else if (mode === "jaccard") {
+    sl.min = 0; sl.max = 1; sl.step = 0.01;
+    sl.disabled = false;
+    help.textContent = "Jaccard index — bounded 0..1";
+    modeHelp.textContent =
+      "c_ij / (c_i + c_j − c_ij) — share of citing articles " +
+      "that cite EITHER reference that cite BOTH";
+  } else if (mode === "association_strength_scaled") {
+    sl.min = 0; sl.max = 5; sl.step = 0.1;
+    sl.disabled = false;
+    help.textContent =
+      "scaled assoc. strength — unbounded, centred near 1";
+    modeHelp.textContent =
+      "N · c_ij / (c_i · c_j) — > 1 means above-chance " +
+      "co-occurrence given N selected articles";
+  }
+  lbl.textContent = sl.value;
+}
+document.getElementById("edgeMode").addEventListener("change",
+  configureNormSlider);
+document.getElementById("minNorm").addEventListener("input", () => {
+  document.getElementById("minNormV").textContent =
+    document.getElementById("minNorm").value;
+});
+// Configure the slider once at load to match the initial dropdown value.
+configureNormSlider();
 
 
 init();
