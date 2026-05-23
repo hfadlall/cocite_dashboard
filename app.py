@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """
-app.py -- Flask backend for the co-citation network dashboard.
+app.py -- Flask backend for the bibliometric co-citation dashboard.
 
-Holds the active corpus + pair index in memory, serves the static
-dashboard, and exposes the analytical functions in cocitation.py
-over HTTP.  All the actual analysis (filtering, edge weighting,
-community detection, bridging metrics) lives in cocitation.py so
-the same code can be used standalone by a collaborator.
+Holds the active corpus + pair index in memory and exposes the
+analytical functions from cocitation.py over HTTP.  The dashboard
+starts with NO data loaded; the user must upload a long-format
+citation CSV via /api/load to populate it.  All the actual analysis
+(filtering, edge weighting, community detection, bridging metrics)
+lives in cocitation.py so the same code can be used standalone by a
+collaborator.
 
 Run:  python app.py
 Then open  http://127.0.0.1:5000
@@ -14,7 +16,6 @@ Then open  http://127.0.0.1:5000
 import csv
 import gzip
 import io
-import json
 import os
 
 from flask import Flask, jsonify, request, send_from_directory
@@ -22,15 +23,10 @@ from flask import Flask, jsonify, request, send_from_directory
 from preprocess import build_from_csv
 from cocitation import EDGE_WEIGHT_MODES, build_cocitation_graph
 
-BASE = os.path.dirname(os.path.abspath(__file__))
-CORPUS_PATH = os.path.join(BASE, "data", "corpus.json")
-PAIRS_PATH = os.path.join(BASE, "data", "pairs.json")
-
 # Hard ceiling on the COMPRESSED upload size. Vercel Hobby caps request
 # bodies at ~4.5 MB; the frontend gzips the CSV before sending so this
-# is what arrives over the wire. Raw CSVs typically compress 6-10x for
-# bibliographic data, so this comfortably accommodates the ~14 MB
-# master_citation_dataset.csv.
+# is what arrives over the wire.  Bibliographic CSVs typically compress
+# 6-10x, so this accommodates raw inputs in the ~30 MB range.
 MAX_UPLOAD_BYTES = 4_500_000
 # Separate guardrail on the DECOMPRESSED size to bound memory + parse
 # time and to neutralise any malformed/gzip-bomb payloads.
@@ -40,52 +36,32 @@ app = Flask(__name__, static_folder="static")
 app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_BYTES + 100_000  # small headroom
 
 # ---------------------------------------------------------------------------
-# Active dataset (module-level globals). Loaded once from the bundled JSON
-# at import time and then mutated in-place when the user uploads a custom
-# CSV via /api/load. Subsequent /api/meta and /api/graph calls read from
-# these globals, so the swap is transparent to the rest of the app.
+# Active dataset (module-level globals).  The dashboard is corpus-
+# agnostic: there is no bundled default.  Both globals stay None until
+# a CSV is uploaded via /api/load, at which point this module holds
+# the parsed corpus in memory until either /api/reset clears it or the
+# Vercel function instance goes cold.
 #
-# Because Vercel functions are stateless, an uploaded dataset only lives
-# as long as the warm container does -- once it goes cold and a fresh
-# instance starts, the bundled corpus is reloaded and the user has to
-# re-upload. For the single-user research workflow this dashboard is
-# built for, that's an acceptable tradeoff vs. introducing a blob store.
+# That ephemerality is intentional.  When the function goes cold and a
+# new instance starts, the user re-uploads -- there is no persistent
+# server-side state and no shared corpus across users.
 # ---------------------------------------------------------------------------
 CORPUS = None
 PAIRS = None
-ACTIVE_SOURCE = "bundled"   # "bundled" or "uploaded" -- exposed via /api/meta
+ACTIVE_SOURCE = "none"   # "none" or "uploaded" -- exposed via /api/meta
 
 
 def _set_active(corpus, pairs, source):
     """Install corpus + pairs as the active dataset for graph queries.
 
-    The Flask handlers below read from these globals and pass them
-    into build_cocitation_graph(); rotating both pointers in one shot
-    keeps any in-flight request consistent.
+    Passing (None, None, "none") returns the dashboard to its empty
+    initial state.  Rotating all three globals in one shot keeps any
+    in-flight request consistent.
     """
     global CORPUS, PAIRS, ACTIVE_SOURCE
     CORPUS = corpus
     PAIRS = pairs
     ACTIVE_SOURCE = source
-
-
-# Load the bundled default at import time.
-for p in (CORPUS_PATH, PAIRS_PATH):
-    if not os.path.exists(p):
-        raise SystemExit(
-            f"Missing {p}\n"
-            f"Run:  python preprocess.py /path/to/master_citation_dataset.csv"
-        )
-with open(CORPUS_PATH) as _f:
-    _bundled_corpus = json.load(_f)
-with open(PAIRS_PATH) as _f:
-    _bundled_pairs = json.load(_f)
-_set_active(_bundled_corpus, _bundled_pairs, "bundled")
-
-print(f"Loaded {len(CORPUS['refs']):,} refs, "
-      f"{len(CORPUS['articles']):,} articles, "
-      f"{len(CORPUS['journals'])} journals, "
-      f"{len(PAIRS['x']):,} co-citation pairs")
 
 
 # ---------------------------------------------------------------------------
@@ -94,17 +70,31 @@ print(f"Loaded {len(CORPUS['refs']):,} refs, "
 def _meta_payload():
     """JSON-serialisable summary of the active corpus.
 
-    Used by /api/meta, /api/load (post-upload echo), and /api/reset.
-    Kept as a single helper so all three stay in lockstep.
+    Returns a uniform shape regardless of whether a corpus is loaded;
+    the ``loaded`` flag and the ``source`` field distinguish the two
+    states.  Empty-corpus values (None years, empty lists, zeros) let
+    the frontend reset its controls without special-casing the keys.
     """
+    if CORPUS is None:
+        return {
+            "loaded": False,
+            "source": ACTIVE_SOURCE,  # "none"
+            "year_min": None,
+            "year_max": None,
+            "journals": [],
+            "n_articles": 0,
+            "n_refs": 0,
+            "n_pairs": 0,
+        }
     return {
+        "loaded": True,
+        "source": ACTIVE_SOURCE,
         "year_min": CORPUS["year_min"],
         "year_max": CORPUS["year_max"],
         "journals": CORPUS["journals"],
         "n_articles": len(CORPUS["articles"]),
         "n_refs": len(CORPUS["refs"]),
         "n_pairs": len(PAIRS["x"]),
-        "source": ACTIVE_SOURCE,
     }
 
 
@@ -185,13 +175,24 @@ def load():
 
 @app.route("/api/reset", methods=["POST"])
 def reset_corpus():
-    """Revert the active dataset to the bundled corpus."""
-    _set_active(_bundled_corpus, _bundled_pairs, "bundled")
+    """Clear the loaded corpus, returning the dashboard to its empty
+    initial state.  Renamed from "revert" since there is no longer a
+    bundled corpus to revert to: clearing means there is no data at
+    all until the next upload."""
+    _set_active(None, None, "none")
     return jsonify(_meta_payload())
 
 
 @app.route("/api/graph")
 def graph():
+    # Refuse cleanly when no corpus is loaded so the frontend gets a
+    # clear, actionable message instead of a 500.
+    if CORPUS is None:
+        return jsonify({
+            "error": "no corpus loaded -- upload a CSV first",
+            "no_corpus": True,
+        }), 400
+
     try:
         year_from = int(request.args.get("year_from", CORPUS["year_min"]))
         year_to = int(request.args.get("year_to", CORPUS["year_max"]))

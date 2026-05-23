@@ -1,25 +1,30 @@
-# CLAUDE.md — Co-Citation Network Dashboard
+# CLAUDE.md — Bibliometric Co-Citation Network
 
 This file orients Claude Code to the project. Read it before making changes.
 
 ## What this project is
 
-A locally-served interactive dashboard for exploring co-citation patterns
-in a bibliometric corpus on **the political role of the firm** (corporate
-political activity / CPA and political CSR / PCSR research). It is a
-working analytical tool supporting an academic manuscript — not a product.
+A locally-served interactive dashboard for exploring co-citation
+patterns in *any* bibliographic corpus.  The user uploads a long-format
+citation CSV via the sidebar; the dashboard recomputes the network on
+the fly for the selected subset of citing articles.  No data is bundled
+with the dashboard — if no CSV is uploaded, the canvas shows an upload
+prompt.
 
-The corpus: 686 citing articles drawn from 14 management journals,
-~32,800 distinct cited references, ~77,300 co-citation pairs.
+It is a working analytical tool used in academic research, not a
+product.  Published figures for the manuscripts that use it are
+produced in VOSviewer; this dashboard is exploratory scaffolding.
 
 ## The owner
 
-Hussein — a PhD-trained management scholar. The manuscript this dashboard
-supports argues, via co-citation structure, that CPA and PCSR research
-have become separated into weakly-connected clusters (a field-level
-reading of Freeman's separation thesis). The dashboard is exploratory
-scaffolding for that argument; it is NOT the citable artifact. Published
-figures for the paper are produced in VOSviewer.
+Hussein — a PhD-trained management scholar.  The tool was originally
+built to support a manuscript on the political role of the firm
+(corporate political activity / political CSR), arguing via
+co-citation structure that the two sub-literatures have become
+weakly-connected clusters.  The tool has since been generalised so a
+collaborator can drop in any compatible CSV.  Domain-specific framing
+should NOT appear in code, UI copy, or docstrings; keep them
+corpus-agnostic.
 
 Hussein is comfortable in the terminal but is not a software engineer.
 Explain non-trivial changes in plain terms. Prefer clear, well-commented
@@ -29,23 +34,28 @@ code over clever code.
 
 ```
 cocite_dashboard/
-  preprocess.py    master_citation_dataset.csv -> data/corpus.json + data/pairs.json
+  preprocess.py    long-format CSV -> (corpus, pairs) dicts.  build_from_csv
+                   is imported by app.py to parse uploaded CSVs at runtime;
+                   the script can also be invoked directly to write
+                   data/corpus.json + data/pairs.json for offline use.
   cocitation.py    standalone analytical core (no Flask dep): subgraph
-                   filtering, modularity clustering, bridging metrics.
-                   Imported by app.py; also runs as a CLI that writes
-                   GraphML + node/edge CSV for sharing.
+                   filtering, four edge-weight modes, modularity
+                   clustering, bridging metrics.  Imported by app.py;
+                   also runs as a CLI that writes GraphML + node/edge
+                   CSV for sharing.
   app.py           Flask backend; endpoints /api/meta, /api/graph,
-                   /api/load, /api/reset
-  run.sh           convenience launcher
+                   /api/load, /api/reset.  Starts with no data; the
+                   user must upload a CSV.
   requirements.txt Flask + networkx
-  data/            corpus.json, pairs.json  (generated; do not hand-edit)
+  data/            gitignored at runtime; preprocess.py + cocitation.py
+                   CLI write artefacts here for local inspection
   static/
     index.html     dashboard page + all CSS
     app.js         force layout, canvas rendering, controls
   README.md        user-facing documentation
 ```
 
-Run: `python app.py`, then open http://127.0.0.1:5000
+Run: `python app.py`, then open http://127.0.0.1:5000 and upload a CSV.
 
 ## Core concepts — do not get these wrong
 

@@ -8,10 +8,11 @@ __pycache__/
 .venv/
 venv/
 
-# Source CSV is handed off separately, not stored in the repo
+# Source data lives outside the repo; the dashboard requires the user
+# to upload at runtime, and preprocess.py writes its JSON into data/
+# for local use only.
 master_citation_dataset.csv
-
-# cocitation.py writes example exports here; regenerate locally on demand
+data/*.json
 data/exports/
 
 # OS / editor

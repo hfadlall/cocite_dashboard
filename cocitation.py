@@ -54,7 +54,7 @@ Communities are detected with greedy modularity maximisation
 Connected-components is provided as a fallback only if networkx is
 missing.  The choice is deliberate: connected-components collapses the
 whole graph into one component as soon as weak edges are admitted, so
-it would only "find" the CPA/PCSR split at a high edge threshold --
+it would only "find" the major split at a high edge threshold --
 exactly where the bridges of interest have already been filtered away.
 Modularity finds densely-connected subgroups inside one connected
 graph, at any threshold.
@@ -210,8 +210,9 @@ def detect_communities(
 
     Uses greedy modularity maximisation (networkx) when available; that
     finds densely-connected groups even inside one connected graph, so
-    the CPA / PCSR style split is detected at ANY edge threshold, not
-    just once the weak ties have been filtered away.
+    a substantive split between sub-literatures is detected at ANY
+    edge threshold, not just once the weak ties have been filtered
+    away.
 
     Falls back to connected components (via union-find) if networkx is
     not installed -- the result is then much less useful because weak

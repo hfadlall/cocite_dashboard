@@ -85,41 +85,63 @@ function updateLegend() {
     `<div class="row"><span class="dot" style="background:#b9b3a4"></span>no year</div>`;
 }
 
-// ---- meta application (used by init, upload, and revert) ---------------
-// Applies a /api/meta response to the UI. Called any time the active
-// dataset changes, so it must be safe to re-run -- which means clearing
-// the journals dropdown each time before repopulating.
+// ---- meta application (used by init, upload, clear) -------------------
+// Applies a /api/meta response to the UI.  Handles two states:
+//   loaded:true  -- populate the year inputs, journal dropdown, stats
+//   loaded:false -- empty everything and show the upload prompt.
+// Safe to re-run; clears the journals dropdown each time before
+// repopulating.
 function applyMeta(m) {
   META = m;
+  const sel = document.getElementById("jrnl");
+  while (sel.options.length > 1) sel.remove(1);
+  if (!m.loaded) {
+    // No corpus loaded -- show the prompt and clear the controls.
+    document.getElementById("yFrom").value = "";
+    document.getElementById("yTo").value = "";
+    document.getElementById("corpusline").textContent =
+      "no corpus loaded \u2014 upload a CSV to begin";
+    setCorpusTag("none");
+    layout = []; links = []; lastGraph = null;
+    draw();
+    updateLegend();
+    document.getElementById("stats").innerHTML =
+      "<i>upload a CSV file via the corpus panel to begin</i>";
+    document.getElementById("pairsList").innerHTML = "";
+    overlay.classList.remove("hidden");
+    overlay.textContent =
+      "No corpus loaded.\n\nUpload a long-format citation CSV via the " +
+      "Corpus panel to begin. Required columns: citing_UT and " +
+      "cited_canonical_id; year, journal, title, and label columns are " +
+      "optional.";
+    return;
+  }
   document.getElementById("yFrom").value = m.year_min;
   document.getElementById("yTo").value = m.year_max;
   document.getElementById("corpusline").textContent =
     `${m.n_articles} citing articles \u00b7 ${m.n_refs.toLocaleString()} references \u00b7 ` +
     `${m.n_pairs.toLocaleString()} co-citation pairs indexed`;
-  const sel = document.getElementById("jrnl");
-  // first option is the static "All journals" placeholder; drop the rest
-  while (sel.options.length > 1) sel.remove(1);
   m.journals.forEach(j => {
     const o = document.createElement("option");
     o.value = j;
     o.textContent = j.length > 38 ? j.slice(0, 36) + "\u2026" : j;
     sel.appendChild(o);
   });
-  setCorpusTag(m.source || "bundled");
+  setCorpusTag(m.source || "none");
   updateLegend();
 }
 
 function setCorpusTag(source) {
   const tag = document.getElementById("corpusTag");
-  const revertBtn = document.getElementById("resetCorpusBtn");
+  const clearBtn = document.getElementById("resetCorpusBtn");
   if (source === "uploaded") {
-    tag.textContent = "uploaded \u2014 in-memory only";
+    tag.textContent = "loaded \u2014 in-memory only";
     tag.classList.add("uploaded");
-    revertBtn.style.display = "";
+    clearBtn.style.display = "";
   } else {
-    tag.textContent = "bundled";
+    tag.textContent = "no corpus loaded";
     tag.classList.remove("uploaded");
-    revertBtn.style.display = "none";
+    clearBtn.style.display = "none";
   }
 }
 
@@ -129,18 +151,26 @@ async function init() {
   try {
     const m = await fetch("/api/meta").then(r => r.json());
     applyMeta(m);
+    // Only auto-rebuild if a corpus is actually loaded; otherwise the
+    // applyMeta call has already shown the upload prompt.
+    if (m.loaded) rebuild();
   } catch (e) {
     document.getElementById("corpusline").textContent =
       "backend not reachable \u2014 is app.py running?";
     overlay.textContent = "Cannot reach the backend.\nStart it with:  python app.py";
-    return;
   }
-  rebuild();
 }
 
 // ---- fetch + rebuild ----------------------------------------------------
 async function rebuild() {
   const btn = document.getElementById("apply");
+  // Refuse early if no corpus is loaded -- /api/graph would 400.
+  if (META && !META.loaded) {
+    overlay.classList.remove("hidden");
+    overlay.textContent =
+      "No corpus loaded. Upload a CSV via the Corpus panel first.";
+    return;
+  }
   btn.disabled = true;
   overlay.classList.remove("hidden");
   overlay.textContent = "computing co-citation network\u2026";
@@ -758,18 +788,19 @@ async function uploadCSV(file) {
   rebuild();
 }
 
-async function revertCorpus() {
+async function clearCorpus() {
+  // Clears the loaded corpus on the server and returns the UI to
+  // its empty initial state.  applyMeta(loaded:false) handles the
+  // overlay, so no rebuild() is needed afterwards.
   overlay.classList.remove("hidden");
-  overlay.textContent = "reverting to bundled corpus\u2026";
+  overlay.textContent = "clearing corpus\u2026";
   try {
     const r = await fetch("/api/reset", { method: "POST" });
-    if (!r.ok) { overlay.textContent = "revert failed: " + r.statusText; return; }
+    if (!r.ok) { overlay.textContent = "clear failed: " + r.statusText; return; }
     applyMeta(await r.json());
   } catch (e) {
-    overlay.textContent = "revert failed: " + e.message;
-    return;
+    overlay.textContent = "clear failed: " + e.message;
   }
-  rebuild();
 }
 
 // ---- zoom controls -----------------------------------------------------
@@ -911,7 +942,7 @@ document.getElementById("csvFile").addEventListener("change", e => {
   uploadCSV(f);
   e.target.value = "";   // allow re-uploading the same filename
 });
-document.getElementById("resetCorpusBtn").addEventListener("click", revertCorpus);
+document.getElementById("resetCorpusBtn").addEventListener("click", clearCorpus);
 document.getElementById("zoomIn").addEventListener("click", zoomIn);
 document.getElementById("zoomOut").addEventListener("click", zoomOut);
 document.getElementById("zoomFit").addEventListener("click", zoomFit);
